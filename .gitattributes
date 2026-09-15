@@ -1,0 +1,17 @@
+* text=auto eol=lf
+
+# --- Office 系: バイナリ扱い（diff/merge対象外） ---
+*.xlsx binary
+*.xlsm binary
+*.xltx binary
+*.docx binary
+*.dotx binary
+*.pptx binary
+*.potx binary
+
+# --- その他バイナリ ---
+*.pdf binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.zip binary
