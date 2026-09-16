@@ -22,6 +22,9 @@ build/
 .coverage.*
 htmlcov/
 
+# --- pytest tmp_path基点 (Windows環境の%TEMP%配下パーミッション問題の回避用、pyproject.tomlのaddoptsで指定) ---
+.pytest_tmp/
+
 # --- このツールが例外的に個別venvを持つ場合 ---
 .venv/
 

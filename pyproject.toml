@@ -1,9 +1,16 @@
 [project]
 name = "config_backup"
 version = "0.1.0"
-description = ""
+description = "NW機器のコンフィグバックアップツール(マルチベンダー対応、当面はFortiGateのみ)"
+readme = "README.md"
 requires-python = ">=3.14"
-dependencies = []
+dependencies = [
+    "net_config",
+    "rich>=13.0",
+]
+
+[tool.uv.sources]
+net_config = { workspace = true }
 
 [project.scripts]
 config_backup = "config_backup.cli:main"
@@ -14,3 +21,15 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/config_backup"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+# Windows環境で `%TEMP%\pytest-of-<user>` にアクセス権限の問題があり
+# (この配下のディレクトリ一覧取得でPermissionErrorになる事例を確認)、
+# tmp_path系フィクスチャの生成先をリポジトリ直下の作業用ディレクトリに固定する。
+addopts = "--basetemp=.pytest_tmp"
