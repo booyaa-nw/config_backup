@@ -6,11 +6,13 @@ readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "net_config",
+    "common",
     "rich>=13.0",
 ]
 
 [tool.uv.sources]
 net_config = { workspace = true }
+common = { workspace = true }
 
 [project.scripts]
 config_backup = "config_backup.cli:main"

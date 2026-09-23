@@ -264,7 +264,7 @@ def backup_one(target: FortigateTarget, backup_dir: str, full: bool = False,
 
         tac_ok, tac_saved, tac_msg = _fetch_tac_report(
             cli, hostname=cli.fgt_info.hostname, alias=cli.fgt_info.alias,
-            export_dir=target_dir, timeout=tac_timeout,
+            version=cli.fgt_info.version, export_dir=target_dir, timeout=tac_timeout,
         )
         result.tac_ok = tac_ok
         result.tac_status = 'ok' if tac_ok else 'ng'
@@ -286,7 +286,7 @@ def backup_one(target: FortigateTarget, backup_dir: str, full: bool = False,
     return result
 
 
-def _fetch_tac_report(cli: FgtCli, hostname: str, alias: str, export_dir: str,
+def _fetch_tac_report(cli: FgtCli, hostname: str, alias: str, version: str, export_dir: str,
                        timeout: Optional[float]) -> tuple[bool, str, str]:
     """`execute tac report`を取得し、テキストファイルとして保存する(Primary/Secondary共用)。
 
@@ -294,8 +294,12 @@ def _fetch_tac_report(cli: FgtCli, hostname: str, alias: str, export_dir: str,
     (moreページャ対象外・`|`使用不可)を踏まえ、net_config側では生コマンドを
     そのまま送信する(`net_config.ftnt.fgt.cli.execute.TacReport`のdocstring参照)。
 
-    保存ファイル名は`<alias または hostname>_tacreport_<YYYYmmdd_HHMMSS>.log`
-    (こうぢ氏指定、versionは含めない)。コンフィグバックアップと同じ`export_dir`に保存する。
+    保存ファイル名は`<alias または hostname>_<version>_tacreport_<YYYYmmdd_HHMMSS>.log`。
+    当初(2026-09-16指定)はversionを含めない仕様だったが、2026-09-23、FAZ対応の
+    バックアップファイル名にversionを含める修正の際にこうぢさんより「コンフィグ/
+    システムバックアップと同様、TAC reportにもversionを付けて揃えたい」との
+    ご要望があり、FGT/MSW/FAZ全機種のTAC reportファイル名にversionを含めるよう
+    統一した。コンフィグバックアップと同じ`export_dir`に保存する。
 
     戻り値は`(ok, saved_path, message)`。
     """
@@ -307,6 +311,7 @@ def _fetch_tac_report(cli: FgtCli, hostname: str, alias: str, export_dir: str,
         content=let['output'],
         hostname=hostname,
         alias=alias,
+        version=version,
         export_dir=export_dir,
         suffix='tacreport',
         ext='log',
@@ -376,7 +381,7 @@ def _backup_secondary(cli: FgtCli, result: BackupResult, backup_dir: str, full: 
 
         tac_ok, tac_saved, tac_msg = _fetch_tac_report(
             cli, hostname=cli.fgt_info.secondary_hostname, alias=cli.fgt_info.alias,
-            export_dir=backup_dir, timeout=tac_timeout,
+            version=cli.fgt_info.version, export_dir=backup_dir, timeout=tac_timeout,
         )
         result.secondary_tac_ok = tac_ok
         result.secondary_tac_status = 'ok' if tac_ok else 'ng'

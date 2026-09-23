@@ -290,6 +290,19 @@ def test_backup_one_with_tac_success(tmp_path, monkeypatch):
     assert Path(result.tac_saved_path).read_text(encoding='utf-8') == 'tac report dump'
 
 
+def test_tac_report_filename_includes_version(tmp_path, monkeypatch):
+    """こうぢさん指定(2026-09-23): コンフィグバックアップと同様、TAC reportの
+    ファイル名にもversionを含める(MSW/FAZも同様に統一、
+    `config_backup.fortigate._fetch_tac_report()`のdocstring参照)。"""
+    _patch_fgtcli(monkeypatch)
+    target = FortigateTarget(addr='172.16.201.201', user='admin', password='pw', tac=True)
+
+    result = backup_one(target, backup_dir=str(tmp_path))
+
+    from pathlib import Path
+    assert '_7.4.5_tacreport_' in Path(result.tac_saved_path).name
+
+
 def test_backup_one_with_tac_failure(tmp_path, monkeypatch):
     _patch_fgtcli(monkeypatch)
 
