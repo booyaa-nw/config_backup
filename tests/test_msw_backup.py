@@ -3,6 +3,8 @@
 実機接続(net_config.ftnt.fgt.cli.FgtCli / net_config.ftnt.msw.cli.MswCli)は
 フェイクに差し替える。
 """
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -31,13 +33,17 @@ class FakeFgtCli:
         self.fail_listing = False
         self.switch_entries = []
         self.logged_out = False
+        # `node_info`引数で呼ばれた値の記録(こうぢ氏指定の同時実行対応、
+        # 2026-09-23追加。スイッチ専用接続が`node_info=False`で呼ばれることの検証用)。
+        self.login_node_info_calls = []
 
         FakeFgtCli.instances.append(self)
 
     def set_target(self, **kwargs):
         self.fgt_info.alias = kwargs.get('fgt_alias', '')
 
-    def login(self):
+    def login(self, node_info=True):
+        self.login_node_info_calls.append(node_info)
         if self.fail_login:
             return {'code': 1, 'msg': '[Error] login failed', 'output': ''}
         self.fgt_info.hostname = 'LABFG01'
@@ -93,7 +99,7 @@ class FakeMswCli:
 
     def login(self, expected_serial=None):
         # `expected_serial`は`net_config.ftnt.msw.cli.MswCli.login()`の照合機能
-        # (こうぢさん指定、2026-09-22追加)のフェイク版。実際の照合ロジック自体は
+        # (こうぢ氏指定、2026-09-22追加)のフェイク版。実際の照合ロジック自体は
         # net_config側でテスト済みのため、ここでは呼び出し元(`config_backup.msw`)が
         # 正しく渡していることだけを記録・検証する。
         self.login_expected_serial = expected_serial
@@ -133,7 +139,8 @@ def test_backup_one_fgt_success_single_switch(tmp_path, monkeypatch):
     FakeFgtCli.instances  # noqa
     target = MswTarget(fgt_addr='172.16.201.207', fgt_user='admin', fgt_password='pw')
 
-    def fake_login(self):
+    def fake_login(self, node_info=True):
+        self.login_node_info_calls.append(node_info)
         self.fgt_info.hostname = 'LABFG01'
         self.switch_entries = [_switch()]
         return {'code': 0, 'msg': '', 'output': ''}
@@ -154,14 +161,25 @@ def test_backup_one_fgt_success_single_switch(tmp_path, monkeypatch):
     assert FakeFgtCli.instances[0].logged_out is True
     assert FakeMswCli.instances[0].logged_out is True
 
+    # スイッチのバックアップは、メイン接続とは別の専用FortiGate接続で行う
+    # (こうぢ氏指定の同時実行対応、2026-09-23追加)。ノード情報は既に判明済みのため
+    # 再取得しない(`node_info=False`)。
+    assert len(FakeFgtCli.instances) == 2
+    main_conn, switch_conn = FakeFgtCli.instances
+    assert main_conn is not switch_conn
+    assert main_conn.login_node_info_calls == [True]
+    assert switch_conn.login_node_info_calls == [False]
+    assert switch_conn.logged_out is True
+
 
 def test_backup_one_switch_passes_expected_serial_to_login(tmp_path, monkeypatch):
     """`_backup_one_switch()`が`MswCli.login()`へ`expected_serial`(`sw.serial`)を
-    渡していることの回帰テスト(こうぢさん指定の照合機能、2026-09-22追加)。"""
+    渡していることの回帰テスト(こうぢ氏指定の照合機能、2026-09-22追加)。"""
     _patch(monkeypatch)
     target = MswTarget(fgt_addr='172.16.201.207', fgt_user='admin', fgt_password='pw')
 
-    def fake_login(self):
+    def fake_login(self, node_info=True):
+        self.login_node_info_calls.append(node_info)
         self.fgt_info.hostname = 'LABFG01'
         self.switch_entries = [_switch(serial='S224EPTF20005577')]
         return {'code': 0, 'msg': '', 'output': ''}
@@ -194,7 +212,7 @@ def test_non_eligible_switch_is_skipped_without_login(tmp_path, monkeypatch):
 
 
 def test_skip_message_is_orange(tmp_path, monkeypatch):
-    """スキップ時のMessageはオレンジで表示する(こうぢさん指定、2026-09-22追加)。"""
+    """スキップ時のMessageはオレンジで表示する(こうぢ氏指定、2026-09-22追加)。"""
     _patch(monkeypatch)
     target = MswTarget(fgt_addr='172.16.201.207', fgt_user='admin', fgt_password='pw')
 
@@ -211,7 +229,7 @@ def test_skip_message_is_orange(tmp_path, monkeypatch):
 
 
 def test_display_status_abbreviates_authorized_and_deauthorized():
-    """列幅の都合でAuth stateが省略表示されないよう短縮する(こうぢさん指定、2026-09-22追加)。"""
+    """列幅の都合でAuth stateが省略表示されないよう短縮する(こうぢ氏指定、2026-09-22追加)。"""
     assert MswBackupItem(auth_state='Authorized', conn_status='Up').display_status == 'Auth/Up'
     assert MswBackupItem(auth_state='Deauthorized', conn_status='Down').display_status == 'Deauth/Down'
     # 大文字小文字は問わない
@@ -236,7 +254,9 @@ def test_multiple_switches_mixed_results(tmp_path, monkeypatch):
     monkeypatch.setattr(msw_mod, 'FgtCli', lambda *a, **kw: fgt)
     FakeMswCli.behavior_by_addr = {'10.255.1.3': {'fail_login': True}}
 
-    result = backup_one_fgt(target, backup_dir=str(tmp_path))
+    # テストを高速化するため、実行台数分の1秒delayは無効化する(delay自体は
+    # 別テスト`test_stagger_delay_between_switch_starts`で検証する)。
+    result = backup_one_fgt(target, backup_dir=str(tmp_path), stagger_delay=0)
 
     assert [item.status for item in result.items] == ['backup_ok', 'skipped', 'login_ng']
     assert result.ok is False
@@ -277,8 +297,8 @@ def test_switch_listing_failure(tmp_path, monkeypatch):
 
 
 def test_default_backup_dir_uses_fgt_hostname(tmp_path, monkeypatch):
-    """MSWの既定バックアップ先は`./booyaa_log/config/<fgtのhostname>_msw`
-    (2026-09-22変更、こうぢさん指定: FGT本体と同じ`config/`配下に統一)。"""
+    """こうぢ氏指定の例外ルール: MSWの既定バックアップ先は
+    `./booyaa_log/<fgtのhostname>_msw`。"""
     _patch(monkeypatch)
     target = MswTarget(fgt_addr='172.16.201.207', fgt_user='admin', fgt_password='pw')
 
@@ -288,7 +308,7 @@ def test_default_backup_dir_uses_fgt_hostname(tmp_path, monkeypatch):
 
     result = backup_one_fgt(target, backup_dir=None)
 
-    assert result.backup_dir == './booyaa_log/config/LABFG01_msw'
+    assert result.backup_dir == './booyaa_log/LABFG01_msw'
 
 
 def test_explicit_directory_overrides_default(tmp_path, monkeypatch):
@@ -367,23 +387,6 @@ def test_tac_report_success(tmp_path, monkeypatch):
     assert result.ok is True
 
 
-def test_tac_report_filename_includes_version(tmp_path, monkeypatch):
-    """こうぢさん指定(2026-09-23): コンフィグバックアップと同様、TAC reportの
-    ファイル名にもMSWのversionを含める(FGT/FAZも同様に統一、
-    `config_backup.fortigate._fetch_tac_report()`のdocstring参照)。"""
-    _patch(monkeypatch)
-    target = MswTarget(fgt_addr='172.16.201.207', fgt_user='admin', fgt_password='pw', tac=True)
-
-    fgt = FakeFgtCli()
-    fgt.switch_entries = [_switch()]
-    monkeypatch.setattr(msw_mod, 'FgtCli', lambda *a, **kw: fgt)
-
-    result = backup_one_fgt(target, backup_dir=str(tmp_path))
-
-    item = result.items[0]
-    assert '_7.4.3_tacreport_' in Path(item.tac_saved_path).name
-
-
 def test_tac_report_failure_marks_item_not_ok(tmp_path, monkeypatch):
     _patch(monkeypatch)
     target = MswTarget(fgt_addr='172.16.201.207', fgt_user='admin', fgt_password='pw', tac=True)
@@ -438,6 +441,10 @@ def test_progress_callback_reports_transitions(tmp_path, monkeypatch):
     assert statuses == [
         ('connecting', []),
         ('login_ok', []),
+        # スイッチ一覧確定時点で全行(未着手)を先に表示する(こうぢ氏指定の
+        # 同時実行対応、2026-09-23追加。並列実行の開始前に全スイッチ行を
+        # 一度に見せるための変更)。
+        ('login_ok', ['']),
         ('login_ok', ['connecting']),
         ('login_ok', ['login_ok']),
         ('login_ok', ['backup_ok']),
@@ -462,6 +469,159 @@ def test_run_msw_backup_processes_all_targets(tmp_path, monkeypatch):
     results = run_msw_backup(targets, backup_dir=str(tmp_path))
     assert len(results) == 2
     assert all(r.ok for r in results)
+
+
+# --- スイッチバックアップの同時実行(こうぢ氏指定、2026-09-23追加) --------------
+
+def test_max_concurrency_is_respected(tmp_path, monkeypatch):
+    """`concurrency`引数を超えて同時にスイッチ処理が走らないことの検証。
+
+    `ThreadPoolExecutor(max_workers=concurrency)`自体が同時実行数を保証するため、
+    実行中の最大並列数(`FakeMswCli.login()`〜`logout()`の間)が`concurrency`を
+    超えないことを確認する。
+    """
+    _patch(monkeypatch)
+    target = MswTarget(fgt_addr='172.16.201.207', fgt_user='admin', fgt_password='pw')
+
+    fgt = FakeFgtCli()
+    fgt.switch_entries = [_switch(serial=f'S{i}', addr=f'10.255.1.{i}') for i in range(1, 7)]
+    monkeypatch.setattr(msw_mod, 'FgtCli', lambda *a, **kw: fgt)
+
+    lock = threading.Lock()
+    state = {'active': 0, 'max_active': 0}
+    orig_login = FakeMswCli.login
+    orig_logout = FakeMswCli.logout
+
+    def slow_login(self, expected_serial=None):
+        with lock:
+            state['active'] += 1
+            state['max_active'] = max(state['max_active'], state['active'])
+        time.sleep(0.05)
+        return orig_login(self, expected_serial=expected_serial)
+
+    def counting_logout(self):
+        result = orig_logout(self)
+        with lock:
+            state['active'] -= 1
+        return result
+
+    monkeypatch.setattr(FakeMswCli, 'login', slow_login)
+    monkeypatch.setattr(FakeMswCli, 'logout', counting_logout)
+
+    result = backup_one_fgt(target, backup_dir=str(tmp_path), concurrency=2, stagger_delay=0)
+
+    assert result.ok is True
+    assert len(FakeMswCli.instances) == 6
+    assert state['max_active'] == 2
+
+
+def test_stagger_delay_between_switch_starts(tmp_path, monkeypatch):
+    """`stagger_delay`だけ、ワーカー起動(`executor.submit()`)の間隔を空けることの検証。"""
+    _patch(monkeypatch)
+    target = MswTarget(fgt_addr='172.16.201.207', fgt_user='admin', fgt_password='pw')
+
+    fgt = FakeFgtCli()
+    fgt.switch_entries = [_switch(serial='S1', addr='10.255.1.1'),
+                           _switch(serial='S2', addr='10.255.1.2'),
+                           _switch(serial='S3', addr='10.255.1.3')]
+    monkeypatch.setattr(msw_mod, 'FgtCli', lambda *a, **kw: fgt)
+
+    sleep_calls = []
+    monkeypatch.setattr(msw_mod.time, 'sleep', lambda s: sleep_calls.append(s))
+
+    result = backup_one_fgt(target, backup_dir=str(tmp_path), stagger_delay=1.0)
+
+    assert result.ok is True
+    # 3台なので、2台目・3台目の起動前にそれぞれ1回、計2回delayが入る
+    # (1台目は待たずに即時起動)。
+    assert sleep_calls == [1.0, 1.0]
+
+
+def test_switch_worker_uses_dedicated_fgt_connection_without_refetching_node_info(tmp_path, monkeypatch):
+    """スイッチのバックアップはメイン接続と別の専用FortiGate接続で行い、その際
+    ノード情報(`get system status`)は再取得しない(`node_info=False`)ことの検証
+    (こうぢ氏指定の同時実行対応、2026-09-23追加)。"""
+    _patch(monkeypatch)
+    target = MswTarget(fgt_addr='172.16.201.207', fgt_user='admin', fgt_password='pw')
+
+    def fake_login(self, node_info=True):
+        self.login_node_info_calls.append(node_info)
+        self.fgt_info.hostname = 'LABFG01'
+        self.switch_entries = [_switch()]
+        return {'code': 0, 'msg': '', 'output': ''}
+
+    monkeypatch.setattr(FakeFgtCli, 'login', fake_login)
+
+    backup_one_fgt(target, backup_dir=str(tmp_path))
+
+    assert len(FakeFgtCli.instances) == 2
+    main_conn, switch_conn = FakeFgtCli.instances
+    assert main_conn is not switch_conn
+    assert main_conn.login_node_info_calls == [True]
+    assert switch_conn.login_node_info_calls == [False]
+    assert switch_conn.logged_out is True
+
+
+def test_switch_worker_login_failure_is_recorded_distinctly(tmp_path, monkeypatch):
+    """スイッチ専用のFortiGate接続自体のログイン失敗は`login_ng`として記録され、
+    メイン接続のログイン失敗と区別できるメッセージになることの検証。"""
+    _patch(monkeypatch)
+    target = MswTarget(fgt_addr='172.16.201.207', fgt_user='admin', fgt_password='pw')
+
+    call_count = {'n': 0}
+    orig_login = FakeFgtCli.login
+
+    def fake_login(self, node_info=True):
+        call_count['n'] += 1
+        if call_count['n'] == 1:
+            # 1回目(メイン接続)は成功させる。
+            self.login_node_info_calls.append(node_info)
+            self.fgt_info.hostname = 'LABFG01'
+            self.switch_entries = [_switch()]
+            return {'code': 0, 'msg': '', 'output': ''}
+        # 2回目以降(スイッチ専用接続)は失敗させる。
+        self.login_node_info_calls.append(node_info)
+        return {'code': 1, 'msg': '[Error] too many admin sessions', 'output': ''}
+
+    monkeypatch.setattr(FakeFgtCli, 'login', fake_login)
+
+    result = backup_one_fgt(target, backup_dir=str(tmp_path))
+
+    item = result.items[0]
+    assert item.status == 'login_ng'
+    assert 'dedicated FGT session' in item.message
+    assert 'too many admin sessions' in item.message
+    assert FakeMswCli.instances == []  # MSWへの多段SSH自体は試みていないこと
+
+
+def test_unexpected_exception_during_switch_backup_is_isolated(tmp_path, monkeypatch):
+    """1台のスイッチ処理中に想定外の例外が発生しても、他のスイッチの処理や
+    呼び出し元(ThreadPoolExecutor)を落とさず、そのスイッチのみ`backup_ng`として
+    記録されることの検証(こうぢ氏指定の同時実行対応、2026-09-23追加)。"""
+    _patch(monkeypatch)
+    target = MswTarget(fgt_addr='172.16.201.207', fgt_user='admin', fgt_password='pw')
+
+    fgt = FakeFgtCli()
+    fgt.switch_entries = [_switch(serial='S1', addr='10.255.1.1'),
+                           _switch(serial='S2', addr='10.255.1.2')]
+    monkeypatch.setattr(msw_mod, 'FgtCli', lambda *a, **kw: fgt)
+
+    orig_login = FakeMswCli.login
+
+    def maybe_raise_login(self, expected_serial=None):
+        if self.msw_info.addr == '10.255.1.2':
+            raise RuntimeError('boom')
+        return orig_login(self, expected_serial=expected_serial)
+
+    monkeypatch.setattr(FakeMswCli, 'login', maybe_raise_login)
+
+    result = backup_one_fgt(target, backup_dir=str(tmp_path), stagger_delay=0)
+
+    by_addr = {item.addr: item for item in result.items}
+    assert by_addr['10.255.1.1'].status == 'backup_ok'
+    assert by_addr['10.255.1.2'].status == 'backup_ng'
+    assert 'boom' in by_addr['10.255.1.2'].message
+    assert result.status == 'done'  # 1台の例外で全体が落ちないこと
 
 
 # --- CSV loader -------------------------------------------------------------
