@@ -237,3 +237,71 @@ def test_faz_table_columns():
 
     headers = [c.header for c in table.columns]
     assert headers == ['Addr', 'Hostname', 'User', 'Login', 'Config', 'System', 'TAC', 'Message']
+
+
+# ----------------------------------------------------------------------
+# ax(Alaxala AX3000、2026-09-23追加)
+# ----------------------------------------------------------------------
+def test_ax_target_mode_defaults():
+    from config_backup.alaxala import DEFAULT_CONCURRENCY
+    parser = build_parser()
+    args = parser.parse_args(['ax', '-t', '172.16.201.205', '-u', 'nwadmin', '-p', 'P@ssw0rd'])
+    assert args.vendor == 'ax'
+    assert args.enable_password == ''
+    assert args.no_software is False
+    assert args.tac is False
+    assert args.directory is None
+    assert args.concurrency == DEFAULT_CONCURRENCY == 5
+    assert args.ftp_user == '' and args.ftp_password == ''
+
+
+def test_ax_options():
+    parser = build_parser()
+    args = parser.parse_args(['ax', '-t', '172.16.201.205', '-u', 'nwadmin', '-p', 'pw',
+                              '-e', 'EnPass', '--no-software', '--tac', '--tac-timeout', '1200'])
+    assert args.enable_password == 'EnPass'
+    assert args.no_software is True
+    assert args.tac is True
+    assert args.tac_timeout == 1200.0
+
+
+def test_ax_has_no_ftp_port_option():
+    """`backup ftp`はポート番号を指定できないため、--ftp-portは設けない(21番固定)。"""
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(['ax', '-t', '1.2.3.4', '-u', 'a', '-p', 'b', '--ftp-port', '2121'])
+
+
+def test_ax_target_and_file_are_mutually_exclusive():
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(['ax', '-t', '1.2.3.4', '-f', 'target.csv'])
+
+
+def test_ax_comma_separated_targets(monkeypatch):
+    import config_backup.cli as cli_mod
+    captured = {}
+
+    def fake_run(targets, args):
+        captured['targets'] = targets
+        return []
+
+    monkeypatch.setattr(cli_mod, '_run_ax_with_live_progress', fake_run)
+    rc = cli_mod.main(['ax', '-t', '10.0.0.1, 10.0.0.2,', '-u', 'nwadmin', '-p', 'pw',
+                       '-e', 'en', '--no-software', '--tac'])
+    assert rc == 0
+    assert [t.addr for t in captured['targets']] == ['10.0.0.1', '10.0.0.2']
+    assert all(t.enable_password == 'en' and t.no_software and t.tac for t in captured['targets'])
+
+
+def test_ax_table_shows_noos_and_success():
+    from config_backup.alaxala import AxBackupResult, AxTarget
+    from config_backup.cli import _build_ax_table, _ax_message
+    r = AxBackupResult(target=AxTarget(addr='1.1.1.1', user='u', password='p', no_software=True),
+                       hostname='sw', version='12.1.W', status='done',
+                       config_status='ok', sys_status='ok')
+    table = _build_ax_table([r], title='t')
+    assert [c.header for c in table.columns] == [
+        'Addr', 'Hostname', 'Version', 'User', 'Login', 'Config', 'System', 'TAC', 'Message']
+    assert 'no-os' in list(table.columns[6].cells)[0]
+    assert 'success' in _ax_message(r)

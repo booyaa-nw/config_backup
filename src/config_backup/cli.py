@@ -2,7 +2,7 @@
 
 サブコマンドは`fgt`(FortiGate本体、旧`fortigate`から2026-09-22に識別子を
 変更)・`msw`(FortiLink管理スイッチ、2026-09-22追加)・`faz`(FortiAnalyzer、
-2026-09-22追加)の3つ。将来Alaxala等を追加する際は、`build_parser()`に
+2026-09-22追加)・`ax`(Alaxala AX3000シリーズ、2026-09-23追加)の4つ。将来Alaxala等を追加する際は、`build_parser()`に
 新しいサブコマンドを追加していく想定(既存サブコマンドの引数には影響しない)。
 
 `./bin`シムの起動方式(`python -m <モジュール>`)に合わせ、本モジュールは
@@ -18,6 +18,13 @@ from rich.console import Console
 from rich.live import Live
 from rich.table import Table
 
+from config_backup.alaxala import (
+    DEFAULT_CONCURRENCY as AX_DEFAULT_CONCURRENCY,
+    AxBackupResult,
+    AxTarget,
+    load_ax_list_csv,
+    run_alaxala_backup,
+)
 from config_backup.faz import (
     FTP_DEFAULT_PORT,
     FazBackupResult,
@@ -125,6 +132,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_fgt_subcommand(subparsers)
     _add_msw_subcommand(subparsers)
     _add_faz_subcommand(subparsers)
+    _add_ax_subcommand(subparsers)
 
     return parser
 
@@ -733,6 +741,226 @@ def _run_faz_with_live_progress(targets: list[FazTarget], backup_dir: str | None
             progress_callback=on_progress,
         )
         live.update(_build_faz_table(results, title='FortiAnalyzer Backup'))
+
+    return results
+
+
+# ======================================================================
+# Alaxala AX3000シリーズ(`ax`サブコマンド、2026-09-23追加)
+# ======================================================================
+_AX_STATUS_TEXT: dict[str, str] = {
+    'waiting': '[dim]Waiting[/]',
+    'connecting': '[yellow]Connecting...[/]',
+    'login_ng': '[red]NG[/]',
+    'login_ok': '[green]OK[/]',
+    'done': '[green]OK[/]',
+}
+
+
+def _add_ax_subcommand(subparsers) -> None:
+    msg = dedent("""\
+        ~~~ Alaxala AX3000 Backup (Config + System [+ TAC]) ~~~
+        1台につき以下を取得する。
+          * コンフィグ     : show configuration
+          * システム       : backup ftp <このPCのアドレス> <ファイル名> [no-software]
+          * TAC report     : show tech-support (--tac 指定時のみ)
+        ログイン後は "set terminal pager disable" でページャを無効化し、
+        enable で装置管理者モードへ移行する(enableパスワードは有り/無しどちらにも対応)。
+
+        ## 単体指定
+        config_backup ax -t 172.16.201.205 -u nwadmin -p P@ssw0rd
+
+        ## enableパスワードを指定(未指定時は -p と同じ値。enableパスワード無しの装置では使われない)
+        config_backup ax -t 172.16.201.205 -u nwadmin -p P@ssw0rd -e P@ssw0rd
+
+        ## システムバックアップからOSを除外 / TAC reportも取得
+        config_backup ax -t 172.16.201.205 -u nwadmin -p P@ssw0rd --no-software --tac
+
+        ## 複数台(同じ認証情報)をカンマ区切りで指定
+        config_backup ax -t 172.16.201.205,172.16.201.206 -u nwadmin -p P@ssw0rd
+
+        ## CSVファイル指定
+        config_backup ax -f target.csv
+
+        ### target csv format
+        * [optional]header line: addr,user,password,enable_password,alias,backup_dir,ssh_port,tac,no_software
+        * data line: <addr>,<user>,<password>,[enable_password],[alias],[backup_dir],[ssh_port],[yes|no],[yes|no]
+
+        ### 同時実行
+        複数台の場合、最大5台を同時実行する(1台ごとに1秒ずつずらして開始)。
+
+        ### システムバックアップ用FTPサーバ
+        "backup ftp"はポート番号を指定できないため、本ツールは実行中だけ
+        受信用FTPサーバを21番ポートで起動し、全台で共有する。
+        21番が使用中・bind不可の場合、システムバックアップのみNGになる
+        (コンフィグ・TAC reportは続行)。
+
+        ### ファイル名 (FAZと同様、alias指定の有無に関わらずホスト名基準)
+        <hostname>_<version>_<YYYYmmdd_HHMMSS>.conf
+        <hostname>_<version>_systembackup_<ts>.dat   (--no-software時: _systembackup_noos)
+        <hostname>_<version>_tacreport_<ts>.log
+        既定の保存先は "./booyaa_log/config/"。
+    """)
+
+    p = subparsers.add_parser(
+        'ax',
+        help='Alaxala AX3000シリーズのコンフィグ+システム(+TAC)バックアップ',
+        description=msg,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    target_group = p.add_mutually_exclusive_group(required=True)
+    target_group.add_argument('-t', '--target', help='装置のipaddr or hostname(カンマ区切りで複数可)')
+    target_group.add_argument('-f', '--file', help='target csv file')
+
+    target_only = p.add_argument_group('Target Mode (-t 指定時に必要)')
+    target_only.add_argument('-u', '--user', help='login user name')
+    target_only.add_argument('-p', '--password', help='login password')
+    target_only.add_argument('-e', '--enable-password', default='',
+                              help='enableパスワード(未指定時は -p と同じ値。'
+                                   'enableパスワード無しの装置では使われない)')
+    target_only.add_argument('-n', '--name', default='', help='[optional] alias(結果表示にのみ使用、ファイル名には使わない)')
+    target_only.add_argument('--ssh-port', type=int, default=22, help='SSH port (default: 22)')
+    target_only.add_argument('--no-software', action='store_true',
+                              help='システムバックアップからOSを除外する("backup ftp ... no-software")')
+    target_only.add_argument('--tac', action='store_true',
+                              help='TAC report("show tech-support")も取得する')
+
+    p.add_argument('--ftp-user', default='',
+                    help='一時FTPサーバのログインユーザー名(未指定時はランダム生成)')
+    p.add_argument('--ftp-password', default='',
+                    help='一時FTPサーバのログインパスワード(未指定時はランダム生成)')
+    p.add_argument('-d', '--directory', default=None,
+                    help='backup directory (既定: "./booyaa_log/config")')
+    p.add_argument('--concurrency', type=int, default=AX_DEFAULT_CONCURRENCY,
+                    help=f'同時実行数 (default: {AX_DEFAULT_CONCURRENCY})')
+    p.add_argument('--timeout', type=float, default=60.0,
+                    help='ログイン/コンフィグ取得等のコマンドタイムアウト(秒、default: 60)')
+    p.add_argument('--sys-backup-timeout', type=float, default=None,
+                    help='システムバックアップ("backup ftp")のタイムアウト(秒、default: 1800)')
+    p.add_argument('--tac-timeout', type=float, default=None,
+                    help='TAC report("show tech-support")のタイムアウト(秒、default: 900)')
+    p.add_argument('--debug-log', metavar='PATH',
+                    help='scrapliのCLIセッションをPATHにデバッグログとして出力する(調査用)')
+
+    p.set_defaults(handler=_handle_ax)
+
+
+def _ax_message(r: AxBackupResult) -> str:
+    parts = []
+    if r.message:
+        parts.append(r.message)
+    if r.sys_status == 'ng' and r.sys_message:
+        parts.append(f'[red][System] {r.sys_message}[/]')
+    if r.tac_requested and r.tac_status == 'ng' and r.tac_message:
+        parts.append(f'[red][TAC] {r.tac_message}[/]')
+    if not parts and r.ok:
+        parts.append('[green]success[/]')
+    return '\n'.join(parts)
+
+
+def _build_ax_table(results: list[AxBackupResult], title: str) -> Table:
+    table = Table(title=title)
+    table.add_column('Addr', style='cyan', no_wrap=True)
+    table.add_column('Hostname', style='cyan')
+    table.add_column('Version', style='cyan')
+    table.add_column('User', style='magenta')
+    table.add_column('Login', style='green')
+    table.add_column('Config', style='green')
+    table.add_column('System', style='green')
+    table.add_column('TAC')
+    table.add_column('Message', style='white', no_wrap=False, overflow='fold')
+
+    for r in results:
+        login_txt = _AX_STATUS_TEXT.get(r.status, '')
+        sys_txt = _faz_stage_text(r.sys_status)
+        if r.target.no_software and r.sys_status == 'ok':
+            sys_txt = '[green]OK[/](no-os)'
+        tac_txt = _TAC_STATUS_TEXT.get(r.tac_status, '-') if r.tac_requested else '-'
+        table.add_row(r.target.addr, r.hostname, r.version, r.target.user, login_txt,
+                      _faz_stage_text(r.config_status), sys_txt, tac_txt, _ax_message(r))
+    return table
+
+
+def _print_ax_saved_paths(results: list[AxBackupResult]) -> None:
+    console = Console()
+    for r in results:
+        for path in (r.config_saved_path, r.sys_saved_path, r.tac_saved_path):
+            if path:
+                console.print(f'[green]saved[/]: {path}')
+
+
+def _split_targets(value: str) -> list[str]:
+    return [v.strip() for v in value.split(',') if v.strip()]
+
+
+def _handle_ax(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    if args.target and (not args.user or not args.password):
+        parser.error('-u/--user と -p/--password は -t/--target 指定時に必須です。')
+
+    if args.debug_log:
+        from net_config.debug import enable_debug_logging
+        enable_debug_logging(args.debug_log)
+
+    if args.target:
+        targets = [AxTarget(
+            addr=addr,
+            user=args.user,
+            password=args.password,
+            enable_password=args.enable_password,
+            alias=args.name,
+            ssh_port=args.ssh_port,
+            tac=args.tac,
+            no_software=args.no_software,
+        ) for addr in _split_targets(args.target)]
+    else:
+        try:
+            targets = load_ax_list_csv(args.file)
+        except FileNotFoundError as e:
+            parser.error(str(e))
+            return 2
+
+    if not targets:
+        parser.error('no valid target found')
+        return 2
+
+    results = _run_ax_with_live_progress(targets, args)
+    _print_ax_saved_paths(results)
+    return 0 if all(r.ok for r in results) else 1
+
+
+def _run_ax_with_live_progress(targets: list[AxTarget], args: argparse.Namespace) -> list[AxBackupResult]:
+    """`run_alaxala_backup()`をrich.Liveの進捗表示付きで実行する。
+
+    同じアドレスが重複指定されても(ポート違い等)行が潰れないよう、状態は対象オブジェクト
+    (`id(target)`)単位で管理する。
+    """
+    console = Console()
+    title = 'Alaxala Backup'
+    state: dict[int, AxBackupResult] = {
+        id(t): AxBackupResult(target=t, tac_requested=t.tac, status='waiting') for t in targets
+    }
+
+    def render() -> Table:
+        return _build_ax_table([state[id(t)] for t in targets], title=title)
+
+    def on_progress(result: AxBackupResult) -> None:
+        state[id(result.target)] = result
+        live.update(render())
+
+    with Live(render(), console=console, refresh_per_second=8, transient=False) as live:
+        results = run_alaxala_backup(
+            targets,
+            backup_dir=args.directory,
+            timeout=args.timeout,
+            sys_backup_timeout=args.sys_backup_timeout,
+            tac_timeout=args.tac_timeout,
+            ftp_user=args.ftp_user,
+            ftp_password=args.ftp_password,
+            progress_callback=on_progress,
+            concurrency=args.concurrency,
+        )
+        live.update(_build_ax_table(results, title=title))
 
     return results
 
